@@ -1,0 +1,118 @@
+#!/bin/bash
+
+ret=0
+
+PATH=/bin:/sbin:/usr/bin:/usr/local/bin:/opt/puppet/bin
+
+declare -a puppeterrorfiles
+declare -a erberrorfiles
+
+# Gather pack info from stdin
+read oldrev newrev ref
+
+#Cycle though each file that was changed in this pack
+for file in $(git diff-tree -r --no-commit-id --name-only $oldrev..$newrev); do
+   tmpdir=$(mktemp -d)
+   tmpfile="$tmpdir/$file"
+   tmperror="$tmpdir/errors.txt"
+   # If this file is in a directory, this will create all the parent directories
+   mkdir -p $tmpfile
+
+   # We created a directory named our file above, with the real purpose of
+   # creating parent directories.  We need to remove the directory that
+   # is named the same as our file so we can populate it with the real file contents
+   rmdir $tmpfile
+
+   # Populate the tmp file from the commited version of the file.  We redirect errors
+   # to /dev/null because a common error would be a file that was changed in an early
+   # revision, but then deleted in a later revision.  This will throw a a path not found error
+   git show $newrev:$file > $tmpfile 2>/dev/null
+
+   case $file in
+     *.pp )
+        puppet parser validate $tmpfile > $tmperror 2>&1
+        if [[ $? != 0 ]]; then
+           puppeterrorfiles=("${puppeterrorfiles[@]}" "$file")
+        fi
+     ;;
+     *.erb )
+        cat $tmpfile | erb -P -x -T - | ruby -c > /dev/null 2> $tmperror
+        if [[ $? != 0 ]]; then
+           erberrorfiles=("${erberrorfiles[@]}" "$file")
+        fi
+     ;;
+   esac
+   rm -rf $tmpdir
+done
+
+if [[ "${#puppeterrorfiles[@]}" -gt 0 || "${#erberrorfiles[@]}" -gt 0 ]]; then
+ echo -en "\e[0;31m" >&2
+ syntax_errors=true
+ echo -e "" >&2
+ echo -e "# # # # # # # # # # # # # # # # #" >&2
+ echo -e " Syntax Errors Found" >&2
+ echo -e "# # # # # # # # # # # # # # # # # " >&2
+ echo -e "" >&2
+fi
+if [[ "${#puppeterrorfiles[@]}" -gt 0 ]]; then
+ echo -e "Puppet syntax errors were found in one or more files you tried to commit" >&2
+ echo "Please run \"puppet parser validate <file>\" to get more details" >&2
+ echo "" >&2
+ echo "The following files had errors:" >&2
+ printf -- '\t%s\n' "${puppeterrorfiles[@]}" >&2
+ echo "" >&2
+ echo "NOTE: These are the fully qualified file paths in git, NOT the fully qualified path from wherever you ran you git push." >&2
+ echo "NOTE: Make sure you run the validate command on the appropriate file in your local filesystem." >&2
+ echo "" >&2
+ ret=2
+fi
+
+if [[ "${#erberrorfiles[@]}" -gt 0 ]]; then
+ echo -e "Erb syntax errors were found one or more files you tried to commit" >&2
+ echo "Please run \"cat <file> | erb -P -x -T - | ruby -c\" to get more details" >&2
+ echo "" >&2
+ echo "The following files had errors:" >&2
+ printf -- '\t%s\n' "${erberrorfiles[@]}" >&2
+ echo "" >&2
+ echo "NOTE: These are the fully qualified file paths in git, NOT the fully qualified path from wherever you ran you git push." >&2
+ echo "NOTE: Make sure you run the validate command on the appropriate file in your local filesystem." >&2
+ echo -e "" >&2
+ ret=2
+fi
+
+if $syntax_errors; then
+ echo -en "\e[0m" >&2
+fi
+
+# Value used to restrict file size
+maxfilesize_inmb=10
+(( maxfilesize_inkb = maxfilesize_inmb * 1024 ))
+(( maxfilesize_inbytes = maxfilesize_inkb * 1024 ))
+
+#Cycle though each file that was changed in this pack
+for file in $(git diff-tree -r --no-commit-id --name-only $oldrev..$newrev); do
+   # Look at the size of the file in the latest revision being pushed
+   filesize=$(git ls-tree -r -l $newrev -- "$file"|awk '{print $4}')
+   if [[ -n ${filesize} && ${filesize} -gt ${maxfilesize_inbytes} ]]; then
+     size_error_files=("${size_error_files[@]}" "$file")
+     ret=2
+   fi
+done
+
+if [[ "${#size_error_files[@]}" -gt 0 ]]; then
+ echo -e "\e[0;31m" >&2
+ echo -e "" >&2
+ echo -e "# # # # # # # # # # # # # # # # #" >&2
+ echo -e " Size Errors Found" >&2
+ echo -e "# # # # # # # # # # # # # # # # # " >&2
+ echo -e "" >&2
+ echo -e "${#size_error_files[@]} files were found which exceeds the allowed size limit of ${maxfilesize_inmb}MB for this repository" >&2
+ echo "" >&2
+ echo "Files:" >&2
+ printf -- '   %s\n' "${size_error_files[@]}" >&2
+ echo "" >&2
+ echo -e "" >&2
+ ret=2
+ echo -e "\e[0m" >&2
+fi
+exit $ret
